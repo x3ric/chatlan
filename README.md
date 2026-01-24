@@ -34,6 +34,8 @@ Expand Chat's capabilities beyond the local host through various methods:
 
 #### Port Forwarding
 
+> Note: Not secure; may expose shell access. Use locally only.
+
 Configure port forwarding for the server's port. The server provides the exact command to connect via port forwarding.
 
 #### Third-Party Server Proxy

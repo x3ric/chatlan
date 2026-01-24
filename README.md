@@ -38,7 +38,7 @@ Expand Chat's capabilities beyond the local host through various methods:
 
 Configure port forwarding for the server's port. The server provides the exact command to connect via port forwarding.
 
-#### Third-Party Server Proxy
+##### Third-Party Server Proxy
 
 Services like :
 

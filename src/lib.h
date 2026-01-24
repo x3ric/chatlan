@@ -8,11 +8,11 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <arpa/inet.h>
-#include <ifaddrs.h>
 #include <netinet/in.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <errno.h>
+#include <signal.h>
 #include <readline/readline.h>
 #include <readline/history.h>
 
@@ -26,162 +26,233 @@ struct client_info {
     bool active;
 };
 
-struct client_info clients[MAX_CLIENTS];
-bool server_running = false;
-char *ip = NULL;
-int port = DEFAULT_PORT;
+static struct client_info clients[MAX_CLIENTS];
+static pthread_mutex_t clients_mu = PTHREAD_MUTEX_INITIALIZER;
+static volatile sig_atomic_t server_running = 0;
+static char *ip = NULL;
+static int port = DEFAULT_PORT;
 
-void parse_ip_port(char *arg, char **ip, int *port) {
-    *ip = strtok(arg, ":");
-    char *port_str = strtok(NULL, ":");
-    *port = (port_str != NULL) ? atoi(port_str) : DEFAULT_PORT;
+static void init_runtime(void) {
+    static int inited = 0;
+    if (inited) return;
+    inited = 1;
+    signal(SIGPIPE, SIG_IGN);
+    for (int i = 0; i < MAX_CLIENTS; ++i) clients[i].sock = -1;
 }
 
-void print_ip() {
+static int parse_port_str(const char *s, int defv) {
+    if (!s || !*s) return defv;
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (errno || end == s || *end) return defv;
+    if (v < 1 || v > 65535) return defv;
+    return (int)v;
+}
+
+static void parse_ip_port(char *arg, char **out_ip, int *out_port) {
+    if (!out_ip || !out_port) return;
+    *out_ip = NULL;
+    *out_port = DEFAULT_PORT;
+    if (!arg || !*arg) return;
+    int colons = 0;
+    for (char *p = arg; *p; ++p) if (*p == ':') colons++;
+    if (colons == 1) {
+        char *c = strchr(arg, ':');
+        *c = 0;
+        *out_ip = arg;
+        *out_port = parse_port_str(c + 1, DEFAULT_PORT);
+    } else {
+        *out_ip = arg;
+        *out_port = DEFAULT_PORT;
+    }
+}
+
+static size_t sanitize_text(char *dst, size_t dsz, const char *src, size_t n) {
+    if (!dst || !dsz) return 0;
+    size_t j = 0;
+    for (size_t i = 0; i < n && j + 1 < dsz; ++i) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == 0x1b) { dst[j++] = '?'; continue; }
+        if (c < 0x20 && c != '\n' && c != '\r' && c != '\t') { dst[j++] = '?'; continue; }
+        if (c == 0x7f) { dst[j++] = '?'; continue; }
+        dst[j++] = (char)c;
+    }
+    dst[j] = 0;
+    return j;
+}
+
+static int send_full(int fd, const char *buf, size_t len) {
+    if (fd < 0 || !buf) return -1;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = send(fd, buf + off, len - off,
+#ifdef MSG_NOSIGNAL
+                         MSG_NOSIGNAL
+#else
+                         0
+#endif
+        );
+        if (n > 0) { off += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        return -1;
+    }
+    return 0;
+}
+
+static void send_to_all_clients(const char *message, size_t len, int sender_sock) {
+    int fds[MAX_CLIENTS], k = 0;
+    pthread_mutex_lock(&clients_mu);
+    for (int i = 0; i < MAX_CLIENTS; ++i)
+        if (clients[i].active && clients[i].sock >= 0 && clients[i].sock != sender_sock)
+            fds[k++] = clients[i].sock;
+    pthread_mutex_unlock(&clients_mu);
+    for (int i = 0; i < k; ++i) send_full(fds[i], message, len);
+}
+
+static void cleanup_clients(void) {
+    pthread_mutex_lock(&clients_mu);
+    for (int i = 0; i < MAX_CLIENTS; ++i) {
+        if (clients[i].active && clients[i].sock >= 0) {
+            int fd = clients[i].sock;
+            clients[i].sock = -1;
+            clients[i].active = false;
+            shutdown(fd, SHUT_RDWR);
+            close(fd);
+        }
+    }
+    pthread_mutex_unlock(&clients_mu);
+}
+
+static void print_ip(void) {
+    init_runtime();
     FILE *fp;
     char public_ip[BUFFER_SIZE] = {0};
-    if ((fp = popen("curl -s ifconfig.me", "r")) == NULL) {
-        perror("popen");
-        return;
-    }
-    if (fgets(public_ip, sizeof(public_ip), fp) == NULL) {
-        perror("fgets");
+    if ((fp = popen("curl -fsS --max-time 2 ifconfig.me 2>/dev/null", "r")) != NULL) {
+        if (fgets(public_ip, sizeof(public_ip), fp) != NULL) public_ip[strcspn(public_ip, "\r\n")] = 0;
         pclose(fp);
-        return;
     }
-    pclose(fp);
-    public_ip[strcspn(public_ip, "\n")] = '\0';
+
     int sock;
-    struct sockaddr_in serv = { .sin_family = AF_INET, .sin_port = htons(80) };
-    char local_ip[BUFFER_SIZE] = {0};
+    struct sockaddr_in serv = {.sin_family = AF_INET, .sin_port = htons(80)};
     struct sockaddr_in name;
     socklen_t namelen = sizeof(name);
-    if ((sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-        perror("socket");
-        return;
-    }
+    char local_ip[BUFFER_SIZE] = {0};
+
+    if ((sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0) { perror("socket"); return; }
     inet_pton(AF_INET, "8.8.8.8", &serv.sin_addr);
-    if (connect(sock, (struct sockaddr *)&serv, sizeof(serv)) < 0) {
-        perror("connect");
-        close(sock);
-        return;
-    }
-    if (getsockname(sock, (struct sockaddr *)&name, &namelen) < 0) {
-        perror("getsockname");
-        close(sock);
-        return;
-    }
+    if (connect(sock, (struct sockaddr *)&serv, sizeof(serv)) < 0) { perror("connect"); close(sock); return; }
+    if (getsockname(sock, (struct sockaddr *)&name, &namelen) < 0) { perror("getsockname"); close(sock); return; }
     close(sock);
-    if (inet_ntop(AF_INET, &name.sin_addr, local_ip, sizeof(local_ip)) == NULL) {
-        perror("inet_ntop");
-        return;
-    }
-    printf("Public IP: %s, Local IP: %s -> ./chat -c %s:%d\n", public_ip, local_ip, local_ip, DEFAULT_PORT);
+    if (!inet_ntop(AF_INET, &name.sin_addr, local_ip, sizeof(local_ip))) { perror("inet_ntop"); return; }
+
+    if (public_ip[0]) printf("Public IP: %s, Local IP: %s -> ./chat -c %s:%d\n", public_ip, local_ip, local_ip, port);
+    else printf("Local IP: %s -> ./chat -c %s:%d\n", local_ip, local_ip, port);
 }
 
-int check_server_running(int port) {
+static int check_server_running(int p) {
     int sock;
     struct sockaddr_in serv_addr;
-    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("Socket creation error");
-        return 0;
-    }
+    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) return 0;
     serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(port);
+    serv_addr.sin_port = htons((uint16_t)p);
     serv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        close(sock);
-        return 0;
-    }
+    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) { close(sock); return 0; }
     close(sock);
     return 1;
 }
 
-void send_to_all_clients(char *message, int sender_sock) {
-    for (int i = 0; i < MAX_CLIENTS; ++i) {
-        if (clients[i].active && clients[i].sock != sender_sock) {
-            send(clients[i].sock, message, strlen(message), 0);
-        }
+static int localcmd(char *buffer, int sock) {
+    if (!buffer) return 1;
+    if (!strcmp(buffer, "exit")) {
+        printf("Exiting...\n");
+        if (sock >= 0) { shutdown(sock, SHUT_RDWR); close(sock); }
+        exit(0);
     }
+    if (!strcmp(buffer, "ip")) { print_ip(); return 1; }
+    if (!strcmp(buffer, "help")) {
+        printf("Available commands:\n  help      - Display this help message\n  exit      - Disconnect and exit the program\n  ip        - Shows your ip and command to connect if is a server\n");
+        return 1;
+    }
+    return 0;
 }
 
-void cleanup_clients() {
-    for (int i = 0; i < MAX_CLIENTS; ++i) {
-        if (clients[i].active) {
-            close(clients[i].sock);
-            if (server_running) {
-                printf("\x1b[A\nClient %s:%d Disconnected.\nServer❯ ", inet_ntoa(clients[i].address.sin_addr), ntohs(clients[i].address.sin_port));
-                fflush(stdout);
-            }
-        }
-    }
+struct recv_ctx {
+    int sock;
+    struct sockaddr_in addr;
+    struct client_info *slot;
+    bool is_server;
+};
+
+static void slot_deactivate(struct client_info *slot) {
+    if (!slot) return;
+    pthread_mutex_lock(&clients_mu);
+    slot->active = false;
+    slot->sock = -1;
+    pthread_mutex_unlock(&clients_mu);
 }
 
-void *receive_messages(void *arg) {
-    struct client_info *client = (struct client_info *)arg;
-    int sock = client->sock;
-    struct sockaddr_in addr = client->address;
-    char buffer[BUFFER_SIZE];
-    int valread;
+static void *receive_messages(void *arg) {
+    struct recv_ctx *ctx = (struct recv_ctx *)arg;
+    int sock = ctx->sock;
+    struct sockaddr_in addr = ctx->addr;
+    struct client_info *slot = ctx->slot;
+    bool is_server = ctx->is_server;
+
+    char raw[BUFFER_SIZE];
+    char safe[BUFFER_SIZE * 2];
     bool connected = false;
-    while ((valread = read(sock, buffer, BUFFER_SIZE)) > 0) {
-        if (!connected) {
-            if (server_running)
-                printf("\x1b[A\nClient %s:%d Connected.\n", inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+
+    for (;;) {
+        ssize_t n = read(sock, raw, sizeof(raw));
+        if (n <= 0) break;
+
+        if (is_server && !connected) {
+            char ipbuf[INET_ADDRSTRLEN] = {0};
+            inet_ntop(AF_INET, &addr.sin_addr, ipbuf, sizeof(ipbuf));
+            printf("\x1b[A\nClient %s:%d Connected.\n", ipbuf[0] ? ipbuf : "?", ntohs(addr.sin_port));
             connected = true;
         }
-        if (server_running) {
-            printf("\x1b[2K\r%s\nServer❯ ", buffer);
-            fflush(stdout);
-        } else {
-            printf("\x1b[2K\r%s\n%s❯ ", buffer, getlogin());
-            fflush(stdout);
+
+        size_t sl = sanitize_text(safe, sizeof(safe), raw, (size_t)n);
+
+        if (is_server) printf("\x1b[2K\r%s\nServer❯ ", safe);
+        else {
+            const char *u = getlogin();
+            if (!u || !*u) u = "Client";
+            printf("\x1b[2K\r%s\n%s❯ ", safe, u);
         }
-        send_to_all_clients(buffer, sock);
-        memset(buffer, 0, BUFFER_SIZE);
+        fflush(stdout);
+
+        if (is_server) send_to_all_clients(safe, sl, sock);
     }
-    if (valread == 0 || !server_running) {
-        if (connected && server_running) {
-            printf("\x1b[A\nClient %s:%d Disconnected.\nServer❯ ", inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
-            fflush(stdout);
-        }
-    } else if (valread == -1 && errno != EINTR) {
-        perror("Error reading from socket");
+
+    if (is_server && connected) {
+        char ipbuf[INET_ADDRSTRLEN] = {0};
+        inet_ntop(AF_INET, &addr.sin_addr, ipbuf, sizeof(ipbuf));
+        printf("\x1b[A\nClient %s:%d Disconnected.\nServer❯ ", ipbuf[0] ? ipbuf : "?", ntohs(addr.sin_port));
+        fflush(stdout);
     }
-    client->active = false;
+
+    if (slot) slot_deactivate(slot);
+    shutdown(sock, SHUT_RDWR);
     close(sock);
+    free(ctx);
     return NULL;
 }
 
-int localcmd(char *buffer, int sock) {
-    if (strcmp(buffer, "exit") == 0) {
-        printf("Exiting...\n");
-        if (sock > 0) {
-            close(sock);
-        }
-        exit(0);
-    } else if (strcmp(buffer, "ip") == 0) {
-        print_ip();
-    } else if (strcmp(buffer, "help") == 0) {
-        printf("Available commands:\n  help      - Display this help message\n  exit      - Disconnect and exit the program\n  ip        - Shows your ip and command to connect if is a server\n");
-    } else {
-        return 0;
-    }
-    return 1;
-}
-
-void *server_input(void *arg) {
+static void *server_input(void *arg) {
+    (void)arg;
     char *buffer;
     while (true) {
         buffer = readline("Server❯ ");
-        if (buffer == NULL)
-            break;
-        if (*buffer) { 
+        if (!buffer) break;
+        if (*buffer) {
             add_history(buffer);
-            if (localcmd(buffer, -1) == 0) {
-                char prefixed_message[BUFFER_SIZE + 50];
-                snprintf(prefixed_message, sizeof(prefixed_message), "Server❯ %s", buffer);
-                send_to_all_clients(prefixed_message, -1);
+            if (!localcmd(buffer, -1)) {
+                char msg[BUFFER_SIZE + 64];
+                int n = snprintf(msg, sizeof(msg), "Server❯ %s", buffer);
+                if (n > 0) send_to_all_clients(msg, (size_t)n, -1);
             }
         }
         free(buffer);
@@ -189,129 +260,150 @@ void *server_input(void *arg) {
     return NULL;
 }
 
-void client_input(int sock) {
+static void client_input(int sock) {
     char *buffer;
-    char *login_name = getlogin();
+    const char *login_name = getlogin();
     char name[256];
-    if (login_name) {
-        sprintf(name, "%s❯ ", login_name);
-    } else {
-        sprintf(name, "Client❯ ");
-    }
+    if (login_name && *login_name) snprintf(name, sizeof(name), "%s❯ ", login_name);
+    else snprintf(name, sizeof(name), "Client❯ ");
+
     while (true) {
         buffer = readline(name);
-        if (buffer == NULL)
-            break;
+        if (!buffer) break;
         if (*buffer) {
             add_history(buffer);
-            if (localcmd(buffer, sock) == 0) {
-                char prefixed_message[BUFFER_SIZE + 50];
-                snprintf(prefixed_message, sizeof(prefixed_message), "%s%s", name, buffer);
-                send(sock, prefixed_message, strlen(prefixed_message), 0);
+            if (!localcmd(buffer, sock)) {
+                char msg[BUFFER_SIZE + 300];
+                int n = snprintf(msg, sizeof(msg), "%s%s", name, buffer);
+                if (n > 0) send_full(sock, msg, (size_t)n);
             }
         }
         free(buffer);
     }
 }
 
-void run_server(const char *ip, int port) {
-    struct sockaddr_in address;
-    int server_fd, new_socket;
-    int addrlen = sizeof(address);
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        perror("socket failed");
-        exit(EXIT_FAILURE);
-    }
+static int set_reuse_opts(int fd) {
     int opt = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
-        perror("setsockopt failed");
-        exit(EXIT_FAILURE);
-    }
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) return -1;
+#ifdef SO_REUSEPORT
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) return -1;
+#endif
+    return 0;
+}
+
+static void run_server(const char *bind_ip, int p) {
+    init_runtime();
+    port = p;
+
+    struct sockaddr_in address;
+    int server_fd;
+
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) { perror("socket"); exit(EXIT_FAILURE); }
+    if (set_reuse_opts(server_fd) < 0) { perror("setsockopt"); close(server_fd); exit(EXIT_FAILURE); }
+
+    memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
+    address.sin_port = htons((uint16_t)p);
     address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(port);
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        perror("bind failed");
-        close(server_fd);
-        exit(EXIT_FAILURE);
+
+    if (bind_ip && *bind_ip && strcmp(bind_ip, "0.0.0.0") != 0) {
+        if (inet_pton(AF_INET, bind_ip, &address.sin_addr) != 1) { perror("inet_pton"); close(server_fd); exit(EXIT_FAILURE); }
     }
-    if (listen(server_fd, MAX_CLIENTS) < 0) {
-        perror("listen failed");
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
+
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) { perror("bind"); close(server_fd); exit(EXIT_FAILURE); }
+    if (listen(server_fd, MAX_CLIENTS) < 0) { perror("listen"); close(server_fd); exit(EXIT_FAILURE); }
+
     print_ip();
-    printf("Server listening on port %d\n", port);
-    server_running = true;
+    printf("Server listening on %s:%d\n", (bind_ip && *bind_ip) ? bind_ip : "0.0.0.0", p);
+
+    server_running = 1;
+
     pthread_t input_thread_id;
-    if (pthread_create(&input_thread_id, NULL, server_input, NULL) != 0) {
-        perror("could not create input thread");
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
+    if (pthread_create(&input_thread_id, NULL, server_input, NULL) != 0) { perror("pthread_create"); close(server_fd); exit(EXIT_FAILURE); }
+    pthread_detach(input_thread_id);
+
     while (true) {
-        if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t *)&addrlen)) < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            perror("accept failed");
+        struct sockaddr_in cliaddr;
+        socklen_t addrlen = sizeof(cliaddr);
+        int new_socket = accept(server_fd, (struct sockaddr *)&cliaddr, &addrlen);
+        if (new_socket < 0) {
+            if (errno == EINTR) continue;
+            perror("accept");
             cleanup_clients();
             close(server_fd);
             exit(EXIT_FAILURE);
         }
-        int i;
-        for (i = 0; i < MAX_CLIENTS; ++i) {
-            if (!clients[i].active) {
-                clients[i].sock = new_socket;
-                clients[i].address = address;
-                clients[i].active = true;
-                pthread_t thread_id;
-                if (pthread_create(&thread_id, NULL, receive_messages, (void *)&clients[i]) != 0) {
-                    perror("could not create thread");
-                    close(new_socket);
-                    cleanup_clients();
-                    close(server_fd);
-                    exit(EXIT_FAILURE);
-                }
-                pthread_detach(thread_id);
-                break;
-            }
+
+        int idx = -1;
+        pthread_mutex_lock(&clients_mu);
+        for (int i = 0; i < MAX_CLIENTS; ++i) if (!clients[i].active) { idx = i; break; }
+        if (idx >= 0) {
+            clients[idx].sock = new_socket;
+            clients[idx].address = cliaddr;
+            clients[idx].active = true;
         }
-        if (i == MAX_CLIENTS) {
-            printf("Too many clients. Connection rejected.\n");
+        pthread_mutex_unlock(&clients_mu);
+
+        if (idx < 0) { printf("Too many clients. Connection rejected.\n"); close(new_socket); continue; }
+
+        struct recv_ctx *ctx = calloc(1, sizeof(*ctx));
+        if (!ctx) {
+            slot_deactivate(&clients[idx]);
             close(new_socket);
+            continue;
         }
+        ctx->sock = new_socket;
+        ctx->addr = cliaddr;
+        ctx->slot = &clients[idx];
+        ctx->is_server = true;
+
+        pthread_t thread_id;
+        if (pthread_create(&thread_id, NULL, receive_messages, (void *)ctx) != 0) {
+            perror("pthread_create");
+            slot_deactivate(&clients[idx]);
+            close(new_socket);
+            free(ctx);
+            continue;
+        }
+        pthread_detach(thread_id);
     }
+
     close(server_fd);
-    server_running = false;
+    server_running = 0;
     cleanup_clients();
 }
 
-void run_client(char *ip, int port) {
-    int sock = 0;
+static void run_client(char *server_ip, int p) {
+    init_runtime();
+    port = p;
+
+    int sock;
     struct sockaddr_in serv_addr;
-    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("Socket creation error");
-        exit(EXIT_FAILURE);
-    }
+
+    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) { perror("socket"); exit(EXIT_FAILURE); }
+
+    memset(&serv_addr, 0, sizeof(serv_addr));
     serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip, &serv_addr.sin_addr) <= 0) {
-        perror("Invalid address/Address not supported");
-        exit(EXIT_FAILURE);
-    }
-    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        perror("Connection Failed");
-        exit(EXIT_FAILURE);
-    }
-    printf("Connected to %s:%d.\n", ip, port);
+    serv_addr.sin_port = htons((uint16_t)p);
+
+    if (inet_pton(AF_INET, server_ip, &serv_addr.sin_addr) != 1) { perror("inet_pton"); close(sock); exit(EXIT_FAILURE); }
+    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) { perror("connect"); close(sock); exit(EXIT_FAILURE); }
+
+    printf("Connected to %s:%d.\n", server_ip, p);
+
+    struct recv_ctx *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) { close(sock); exit(EXIT_FAILURE); }
+    ctx->sock = sock;
+    ctx->addr = serv_addr;
+    ctx->slot = NULL;
+    ctx->is_server = false;
+
     pthread_t thread_id;
-    if (pthread_create(&thread_id, NULL, receive_messages, (void *)&sock) < 0) {
-        perror("could not create thread");
-        close(sock);
-        exit(EXIT_FAILURE);
-    }
+    if (pthread_create(&thread_id, NULL, receive_messages, (void *)ctx) != 0) { perror("pthread_create"); close(sock); free(ctx); exit(EXIT_FAILURE); }
+    pthread_detach(thread_id);
+
     client_input(sock);
+    shutdown(sock, SHUT_RDWR);
     close(sock);
 }
 
